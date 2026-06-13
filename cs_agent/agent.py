@@ -60,6 +60,17 @@ Be concise and direct. Resolve the customer's request in as few turns as
 possible: search, then act with the appropriate banking tool, then confirm.
 Only call consult_research_agent(question, context) ONCE, and only for a
 genuinely complex cross-policy question you could not resolve from the KB.
+
+## Completing the request fully
+
+Requests often span several accounts, cards, or transactions. Handle every
+item involved, not just the first:
+- Identify all affected accounts, cards, and transactions up front, then act
+  on each one explicitly.
+- When crediting, refunding, or adjusting an amount, compute it exactly from
+  the transaction records you retrieved. Never estimate or round.
+- Before telling the customer it is done, verify that every required action
+  was completed for every affected item.
 """
 
 GUIDANCE_FULL = """
@@ -84,6 +95,17 @@ conflicts and detailed procedures. Escalate only when the KB is insufficient.
 - format_tool_result(tool_name, result): format tool output for readability.
 - validate_response / self_correct / should_validate: verify and fix answers.
 - get_conversation_context(session_id): recall prior context.
+
+## Completing the request fully
+
+Requests often span several accounts, cards, or transactions. Handle every
+item involved, not just the first:
+- Identify all affected accounts, cards, and transactions up front, then act
+  on each one explicitly.
+- When crediting, refunding, or adjusting an amount, compute it exactly from
+  the transaction records you retrieved. Never estimate or round.
+- Before telling the customer it is done, verify that every required action
+  was completed for every affected item.
 """
 
 if LEAN_MODE:
