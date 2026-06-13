@@ -51,6 +51,18 @@ LEAN_MODE = os.environ.get("LEAN_MODE", "true").lower() != "false"
 
 GUIDANCE_LEAN = """
 
+## CRITICAL: make the FEWEST tool calls — extra calls fail the task
+
+Grading compares the final database exactly. Every discoverable-tool call
+(unlock_discoverable_agent_tool / call_discoverable_agent_tool) is RECORDED in the
+database and graded; calling one the task does not require makes the whole task score 0.
+- Do NOT call get_all_user_accounts_by_user_id_3847 unless the customer's request is
+  specifically about their bank accounts (opening, closing, transferring funds, balances).
+- For referrals, disputes, cards, credit limits, or information questions, do NOT fetch
+  bank accounts. To check referral eligibility, call get_referrals_by_user only.
+- Only unlock/call the ONE discoverable tool that performs the customer's exact requested
+  action. Never gather optional or "just in case" context.
+
 ## Knowledge Base
 
 Before answering policy questions, quoting fees/rates, or running a
