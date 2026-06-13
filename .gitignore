@@ -2,9 +2,7 @@
 *-key.json
 vertex-key.json
 __pycache__/
-
-# Generated embedding cache (regenerate with cs_agent/precompute_embeddings.py)
-kb/embeddings.json
+.venv-test/
 
 # Local-only Compose override (service-account auth for the dev loop); never submitted
 docker-compose.override.yml

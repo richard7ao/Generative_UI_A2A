@@ -43,9 +43,27 @@ def load_documents() -> list[dict]:
     return docs
 
 
+def _wait_for_redis(client, attempts: int = 60, delay: float = 1.0) -> None:
+    """Block until Redis is reachable. `docker compose up` only waits for the
+    redis container to *start*, not for its service DNS to resolve or accept
+    connections, so a cold start can otherwise crash the agent before it serves."""
+    import time
+
+    last_err: Exception | None = None
+    for _ in range(attempts):
+        try:
+            client.ping()
+            return
+        except (redis.exceptions.ConnectionError, OSError) as e:
+            last_err = e
+            time.sleep(delay)
+    raise RuntimeError(f"Redis not reachable after {int(attempts * delay)}s: {last_err}")
+
+
 def build_index() -> None:
     """(Re)create the KB index and load every document, embedding if possible."""
     client = redis.Redis.from_url(REDIS_URL, decode_responses=False)
+    _wait_for_redis(client)
     documents = load_documents()
     if not documents:
         raise RuntimeError(f"No KB documents found in {KB_DOCUMENTS_DIR}")
