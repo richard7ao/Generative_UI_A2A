@@ -15,12 +15,15 @@ from a2a.client import ClientConfig, ClientFactory, minimal_agent_card
 from a2a.types import Message, Part, Role, Task, TextPart
 from google.adk.tools import ToolContext
 
-from env_toolset import session_id
 from circuit_breaker import get_circuit_breaker, CircuitBreaker
 
 RESEARCH_AGENT_URL = os.environ.get("RESEARCH_AGENT_URL", "http://host.docker.internal:8090/research-agent")
 
-_TIMEOUT_S = 300.0
+# Kept well under the harness 5-min per-turn budget: if a research consult takes
+# this long the circuit breaker trips and the CS agent falls back to direct KB
+# search, which still lets it answer the personal agent in time (a hung consult
+# would otherwise drag the whole turn into a scored-0 timeout).
+_TIMEOUT_S = 120.0
 
 # Intent classification patterns (from model example)
 RESEARCH_KEYWORDS = [
@@ -38,7 +41,7 @@ RESEARCH_KEYWORDS = [
 
 SIMPLE_QUERY_PATTERNS = [
     # Direct lookups
-    "what is my", "show me", "get my", "current balance", "account status",
+    "what is my", "what's my", "show me", "get my", "current balance", "account status",
     # Simple questions
     "how much", "when", "where", "what time", "is it open",
     # Status checks
@@ -137,27 +140,15 @@ def classify_research_intent(query: str) -> dict:
         - suggested_approach: str
     """
     query_lower = query.lower()
-    
-    # Check for simple query patterns (definitely don't need research)
-    for pattern in SIMPLE_QUERY_PATTERNS:
-        if pattern in query_lower:
-            return {
-                "needs_research": False,
-                "confidence": "high",
-                "reason": f"Simple query pattern detected: '{pattern}'",
-                "suggested_approach": "Use direct KB search or environment tools"
-            }
-    
-    # Check for research keywords
-    matched_keywords = []
-    for keyword in RESEARCH_KEYWORDS:
-        if keyword in query_lower:
-            matched_keywords.append(keyword)
-    
-    # Check complexity indicators
+
+    # Evaluate research/complexity signals BEFORE the simple-query patterns.
+    # Patterns like "when"/"where" are bare words that can appear as substrings
+    # inside a genuinely complex query (e.g. "...scenarios where fees apply...")
+    # and would otherwise short-circuit it to "no research needed".
+    matched_keywords = [kw for kw in RESEARCH_KEYWORDS if kw in query_lower]
     word_count = len(query.split())
     question_count = query.count("?")
-    
+
     if matched_keywords:
         confidence = "high" if len(matched_keywords) >= 2 else "medium"
         return {
@@ -166,8 +157,8 @@ def classify_research_intent(query: str) -> dict:
             "reason": f"Research keywords detected: {matched_keywords}",
             "suggested_approach": "Escalate to Research Agent for deep analysis"
         }
-    
-    # Check for complexity without keywords
+
+    # Complexity without explicit keywords
     if word_count > 50 or question_count > 1:
         return {
             "needs_research": True,
@@ -175,7 +166,17 @@ def classify_research_intent(query: str) -> dict:
             "reason": f"Complex query (words: {word_count}, questions: {question_count})",
             "suggested_approach": "Consider research if initial KB search fails"
         }
-    
+
+    # Only a query with no research/complexity signals is treated as a simple lookup
+    for pattern in SIMPLE_QUERY_PATTERNS:
+        if pattern in query_lower:
+            return {
+                "needs_research": False,
+                "confidence": "high",
+                "reason": f"Simple query pattern detected: '{pattern}'",
+                "suggested_approach": "Use direct KB search or environment tools"
+            }
+
     # Default: simple query
     return {
         "needs_research": False,
@@ -285,6 +286,11 @@ async def consult_research_agent(
     full_query = question
     if context:
         full_query = f"Question: {question}\n\nContext: {context}"
+
+    # Imported lazily: env_toolset reads required env vars at import time, so a
+    # module-level import would make this whole module (incl. classify_research_intent)
+    # unimportable without the harness env.
+    from env_toolset import session_id
 
     outgoing = Message(
         message_id=uuid.uuid4().hex,
