@@ -1,4 +1,4 @@
-"""Rho-Bank customer service agent: policy + env tools + KB search (RAG)."""
+"""Rho-Bank customer service agent: policy + env tools + KB search (RAG) + research agent."""
 
 import os
 from pathlib import Path
@@ -6,12 +6,63 @@ from pathlib import Path
 from google.adk.agents import LlmAgent
 
 from env_toolset import EnvApiToolset
-from rag_tools import kb_search_bm25, kb_search_vector
+from rag_tools import kb_search_bm25, kb_search_vector, kb_search_enhanced
+from research_client_tool import (
+    consult_research_agent,
+    deep_kb_search,
+    research_policy_conflict,
+    research_procedure,
+    smart_consult_research,
+    classify_research_intent,
+    discover_research_agent,
+    is_research_agent_available,
+)
+from tool_formatters import format_tool_result
+from response_validator import validate_response, self_correct, should_validate
+from failure_tracker import get_failure_tracker
+from conversation_memory import (
+    get_memory,
+    clear_memory,
+    get_conversation_context,
+    clear_conversation_memory,
+)
+from monitoring import get_monitor
 
 MODEL = os.environ.get("MODEL", "gemini-3.5-flash")
+
+# Initialize tracking on module load
+_failure_tracker = get_failure_tracker()
+_performance_monitor = get_monitor()
 POLICY_PATH = Path(os.environ.get("KB_POLICY_PATH", "/app/kb/policy.md"))
 
-RAG_GUIDANCE = """
+# LEAN_MODE (default) keeps the agent fast: one LLM call per turn plus fast
+# (non-LLM) KB search. The full feature set (LLM-judge validation, self-correction,
+# multi-variant research, meta tools) is preserved behind LEAN_MODE=false for A/B
+# testing, but those add several LLM round-trips per turn and time out tau2 tasks.
+LEAN_MODE = os.environ.get("LEAN_MODE", "true").lower() != "false"
+
+GUIDANCE_LEAN = """
+
+## Knowledge Base
+
+Before answering policy questions, quoting fees/rates, or running a
+scenario-specific procedure, search the knowledge base first:
+- kb_search_bm25(query): keyword search.
+- kb_search_vector(query): semantic search for natural-language questions.
+
+Search before you answer. If a search returns nothing useful, rephrase once
+and retry. Ground every policy/number in the search results — never invent
+fees, rates, eligibility rules, or account details.
+
+## Answering
+
+Be concise and direct. Resolve the customer's request in as few turns as
+possible: search, then act with the appropriate banking tool, then confirm.
+Only call consult_research_agent(question, context) ONCE, and only for a
+genuinely complex cross-policy question you could not resolve from the KB.
+"""
+
+GUIDANCE_FULL = """
 
 ## Knowledge Base Access
 
@@ -19,16 +70,57 @@ You do NOT have the knowledge base inlined. Before answering policy questions
 or performing scenario-specific procedures, search the knowledge base:
 - kb_search_bm25(query): keyword search.
 - kb_search_vector(query): semantic search for natural-language questions.
+- kb_search_enhanced(query): search with query expansion for better recall.
 
-Search before you act; procedures, eligibility rules, internal tool names,
-and scenario-specific guidance all live in the knowledge base. If a search
-comes up empty, rephrase and try again before telling the customer you can't
-find the information.
+## Research Agent Support
+
+For complex cross-policy scenarios, call consult_research_agent(question,
+context) or smart_consult_research(question, context). Use
+research_policy_conflict(topic) and research_procedure(task, context) for
+conflicts and detailed procedures. Escalate only when the KB is insufficient.
+
+## Response Quality
+
+- format_tool_result(tool_name, result): format tool output for readability.
+- validate_response / self_correct / should_validate: verify and fix answers.
+- get_conversation_context(session_id): recall prior context.
 """
+
+if LEAN_MODE:
+    _instruction = POLICY_PATH.read_text() + GUIDANCE_LEAN
+    _tools = [
+        EnvApiToolset(),
+        kb_search_bm25,
+        kb_search_vector,
+        consult_research_agent,
+        format_tool_result,
+    ]
+else:
+    _instruction = POLICY_PATH.read_text() + GUIDANCE_FULL
+    _tools = [
+        EnvApiToolset(),
+        kb_search_bm25,
+        kb_search_vector,
+        kb_search_enhanced,
+        consult_research_agent,
+        smart_consult_research,
+        deep_kb_search,
+        research_policy_conflict,
+        research_procedure,
+        classify_research_intent,
+        discover_research_agent,
+        is_research_agent_available,
+        format_tool_result,
+        validate_response,
+        self_correct,
+        should_validate,
+        get_conversation_context,
+        clear_conversation_memory,
+    ]
 
 root_agent = LlmAgent(
     name="cs_agent",
     model=MODEL,
-    instruction=POLICY_PATH.read_text() + RAG_GUIDANCE,
-    tools=[EnvApiToolset(), kb_search_bm25, kb_search_vector],
+    instruction=_instruction,
+    tools=_tools,
 )

@@ -10,8 +10,28 @@ the Redis 8 map-style reply work regardless of redis-py version."""
 import os
 import re
 import struct
+from typing import List
 
 import redis
+
+# Query expansion synonyms for better recall
+QUERY_EXPANSIONS = {
+    # Account types
+    "account": ["account", "checking", "savings", "debit"],
+    "overdraft": ["overdraft", "negative balance", "insufficient funds", "NSF", "fee"],
+    # Transaction terms
+    "transaction": ["transaction", "payment", "transfer", "charge", "debit", "credit"],
+    "dispute": ["dispute", "fraud", "unauthorized", "chargeback", "claim"],
+    # Card terms
+    "card": ["card", "credit card", "debit card", "plastic"],
+    "limit": ["limit", "cap", "maximum", "threshold", "ceiling"],
+    # Service terms
+    "referral": ["referral", "refer a friend", "invite", "recommendation"],
+    "application": ["application", "apply", "request", "submission"],
+    # Policy terms
+    "fee": ["fee", "charge", "cost", "price", "rate"],
+    "policy": ["policy", "rule", "guideline", "procedure", "regulation"],
+}
 
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
 KB_INDEX = "kb_idx"
@@ -77,6 +97,52 @@ def _strip_score(docs: list[dict]) -> list[dict]:
     return docs
 
 
+def expand_query(query: str) -> List[str]:
+    """Expand query with synonyms for better recall.
+    
+    Args:
+        query: Original search query
+        
+    Returns:
+        List of expanded queries including synonyms
+    """
+    query_lower = query.lower()
+    expanded_queries = [query]  # Always include original
+    
+    for keyword, synonyms in QUERY_EXPANSIONS.items():
+        if keyword in query_lower:
+            # Create variations with each synonym
+            for synonym in synonyms:
+                if synonym != keyword:
+                    expanded = query_lower.replace(keyword, synonym)
+                    if expanded not in expanded_queries:
+                        expanded_queries.append(expanded)
+    
+    return expanded_queries
+
+
+def deduplicate_results(results_list: List[list[dict]]) -> list[dict]:
+    """Deduplicate and merge search results from multiple queries.
+    
+    Args:
+        results_list: List of result lists from different queries
+        
+    Returns:
+        Deduplicated merged results
+    """
+    seen_ids = set()
+    merged = []
+    
+    for results in results_list:
+        for doc in results:
+            doc_id = doc.get("doc_id")
+            if doc_id and doc_id not in seen_ids:
+                seen_ids.add(doc_id)
+                merged.append(doc)
+    
+    return merged
+
+
 def kb_search_bm25(query: str, top_k: int = 5) -> list[dict]:
     """Full-text (BM25) search over the Rho-Bank knowledge base.
 
@@ -133,3 +199,32 @@ def kb_search_vector(query: str, top_k: int = 5) -> list[dict]:
                 "Use kb_search_bm25 with keywords instead."
             }
         ]
+
+
+def kb_search_enhanced(query: str, top_k: int = 5) -> list[dict]:
+    """Enhanced search with query expansion for better recall.
+    
+    Performs multiple searches with expanded query variations and merges
+    results, providing better coverage than single-query search.
+    
+    Args:
+        query: Original search query
+        top_k: Number of documents to return (per query variation)
+        
+    Returns:
+        Merged, deduplicated search results
+    """
+    # Expand query with synonyms
+    expanded_queries = expand_query(query)
+    
+    # Search with each variation
+    all_results = []
+    for expanded_query in expanded_queries:
+        results = kb_search_bm25(expanded_query, top_k=min(top_k, 3))
+        all_results.append(results)
+    
+    # Deduplicate and return merged results
+    merged = deduplicate_results(all_results)
+    
+    # Return top_k of merged results
+    return merged[:top_k]

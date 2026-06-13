@@ -16,7 +16,7 @@ import redis
 from redis.commands.search.field import TextField, VectorField
 from redis.commands.search.index_definition import IndexDefinition, IndexType
 
-from rag_tools import DOC_PREFIX, EMBEDDING_DIM, KB_INDEX, REDIS_URL, _embed
+from research_tools import DOC_PREFIX, EMBEDDING_DIM, KB_INDEX, REDIS_URL, _embed
 
 KB_DOCUMENTS_DIR = Path(os.environ.get("KB_DOCUMENTS_DIR", "/app/kb/documents"))
 # Pre-baked {doc_id: base64(float32)} cache (see precompute_embeddings.py).
@@ -50,32 +50,23 @@ def build_index() -> None:
     if not documents:
         raise RuntimeError(f"No KB documents found in {KB_DOCUMENTS_DIR}")
 
-    fields = [
-        TextField("title", weight=2.0),
-        TextField("content"),
-        VectorField(
-            "embedding",
-            "HNSW",
-            {"TYPE": "FLOAT32", "DIM": EMBEDDING_DIM, "DISTANCE_METRIC": "COSINE"},
-        ),
-    ]
-    definition = IndexDefinition(prefix=[DOC_PREFIX], index_type=IndexType.HASH)
-
     try:
         client.ft(KB_INDEX).dropindex(delete_documents=True)
     except redis.ResponseError:
         pass
 
-    try:
-        client.ft(KB_INDEX).create_index(fields=fields, definition=definition)
-    except redis.ResponseError as e:
-        # Idempotent startup: a stale index can survive a partial drop (e.g. when
-        # redis outlives the agent across a rebuild). Drop it hard and retry once.
-        if "Index already exists" in str(e):
-            client.ft(KB_INDEX).dropindex(delete_documents=True)
-            client.ft(KB_INDEX).create_index(fields=fields, definition=definition)
-        else:
-            raise
+    client.ft(KB_INDEX).create_index(
+        fields=[
+            TextField("title", weight=2.0),
+            TextField("content"),
+            VectorField(
+                "embedding",
+                "HNSW",
+                {"TYPE": "FLOAT32", "DIM": EMBEDDING_DIM, "DISTANCE_METRIC": "COSINE"},
+            ),
+        ],
+        definition=IndexDefinition(prefix=[DOC_PREFIX], index_type=IndexType.HASH),
+    )
 
     # Pre-baked cache first; live-embed only the misses (BM25-only if neither).
     cache = load_embedding_cache()
@@ -83,7 +74,7 @@ def build_index() -> None:
     misses = [i for i, b in enumerate(embedding_bytes) if b is None]
     if cache:
         print(
-            f"[ingest] embedding cache hit for {len(documents) - len(misses)}/"
+            f"[research_ingest] embedding cache hit for {len(documents) - len(misses)}/"
             f"{len(documents)} documents",
             file=sys.stderr,
         )
@@ -94,10 +85,10 @@ def build_index() -> None:
                 vectors = _embed([f"{documents[i]['title']}\n{documents[i]['content']}" for i in idx])
                 for i, vector in zip(idx, vectors):
                     embedding_bytes[i] = struct.pack(f"{EMBEDDING_DIM}f", *vector)
-            print(f"[ingest] live-embedded {len(misses)} uncached documents", file=sys.stderr)
+            print(f"[research_ingest] live-embedded {len(misses)} uncached documents", file=sys.stderr)
         except Exception as e:
             print(
-                f"[ingest] embeddings unavailable ({e}); {len(misses)} doc(s) "
+                f"[research_ingest] embeddings unavailable ({e}); {len(misses)} doc(s) "
                 "will be BM25-only (kb_search_bm25 still works)",
                 file=sys.stderr,
             )
@@ -109,7 +100,7 @@ def build_index() -> None:
             mapping["embedding"] = emb
         pipe.hset(f"{DOC_PREFIX}{doc['id']}", mapping=mapping)
     pipe.execute()
-    print(f"[ingest] indexed {len(documents)} documents into {KB_INDEX}", file=sys.stderr)
+    print(f"[research_ingest] indexed {len(documents)} documents into {KB_INDEX}", file=sys.stderr)
 
 
 if __name__ == "__main__":

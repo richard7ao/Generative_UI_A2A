@@ -1,5 +1,7 @@
 """Serve the personal agent over A2A. Run: uvicorn main:app --host 0.0.0.0 --port 9001"""
 
+import auth_hardening  # noqa: F401  resilient OAuth token-refresh transport (import first)
+
 import os
 
 from google.adk.a2a.utils.agent_to_a2a import to_a2a

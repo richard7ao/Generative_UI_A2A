@@ -1,5 +1,13 @@
 .env
+*-key.json
+vertex-key.json
 __pycache__/
 
 # Generated embedding cache (regenerate with cs_agent/precompute_embeddings.py)
 kb/embeddings.json
+
+# Local-only Compose override (service-account auth for the dev loop); never submitted
+docker-compose.override.yml
+
+# Imported Claude/gstack skills (~1 GB, machine-local; keep out of the public repo)
+.claude/skills/
