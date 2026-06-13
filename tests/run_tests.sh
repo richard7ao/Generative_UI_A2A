@@ -14,6 +14,8 @@ UNIT_TESTS=(
     "tests/test_intent_classification.py"
     "tests/test_circuit_breaker.py"
     "tests/test_query_expansion.py"
+    "tests/test_account_advisor.py"
+    "tests/test_banking_rules.py"
 )
 
 echo "=============================================="

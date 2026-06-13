@@ -1,252 +1,237 @@
-"""Evaluation runner for A2A Customer Service Agent.
+"""Evaluation runner for the A2A agent pair.
 
-Runs evaluation against the A2A harness and generates detailed reports.
+Thin wrapper around the `a2a-hack` harness (the sibling a2a-hackathon repo).
+It invokes the harness via `uv run`, runs a task split (train/test/feedback or
+comma-separated task ids) against the locally running agents, then parses the
+tau2 results dir and prints a report.
+
+Usage:
+    python3 eval/run_evaluation.py --tasks test      # test-set score
+    python3 eval/run_evaluation.py --tasks train     # iterate (default)
+    python3 eval/run_evaluation.py --smoke-only      # connectivity check
 """
 
 import json
+import os
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Any
-from dataclasses import dataclass
+from typing import Dict, List
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_HARNESS_DIR = REPO_ROOT.parent / "a2a-hackathon"
 
 
-@dataclass
-class EvalResult:
-    """Result of a single evaluation."""
-    task_id: str
-    passed: bool
-    score: float
-    response_time: float
-    errors: List[str]
-    tools_used: List[str]
-    research_called: bool
+def _load_dotenv(path: Path) -> Dict[str, str]:
+    """Minimal .env reader so the harness subprocess inherits GOOGLE_API_KEY
+    etc. Existing environment values win; we never override them."""
+    env = dict(os.environ)
+    if not path.exists():
+        return env
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip().strip('"').strip("'")
+        env.setdefault(key, value)
+    return env
 
 
 class EvaluationRunner:
-    """Runs evaluation and generates reports."""
-    
+    """Runs the harness against the agent pair and reports a score."""
+
     def __init__(
         self,
         personal_url: str = "http://localhost:9001",
         cs_url: str = "http://localhost:9002",
-        output_dir: str = "results"
+        harness_dir: Path = DEFAULT_HARNESS_DIR,
+        output_dir: Path = None,
     ):
         self.personal_url = personal_url
         self.cs_url = cs_url
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(exist_ok=True)
-        
-        self.results: List[EvalResult] = []
-    
+        self.harness_dir = Path(harness_dir).resolve()
+        if not self.harness_dir.exists():
+            raise FileNotFoundError(
+                f"Harness repo not found at {self.harness_dir}. Clone "
+                "a2anet/a2a-hackathon next to this repo or pass --harness-dir."
+            )
+        # Default to the harness's own results/ dir so `tau2 view` works as
+        # documented in the harness README.
+        self.output_dir = Path(output_dir) if output_dir else self.harness_dir / "results"
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.env = _load_dotenv(REPO_ROOT / ".env")
+
+    def _harness(self, args: List[str], timeout: int) -> subprocess.CompletedProcess:
+        """Invoke `uv run --directory <harness> a2a-hack <args>`."""
+        cmd = ["uv", "run", "--directory", str(self.harness_dir), "a2a-hack", *args]
+        print(f"$ {' '.join(cmd)}")
+        return subprocess.run(cmd, env=self.env, timeout=timeout)
+
     def run_smoke_test(self) -> bool:
-        """Run basic smoke test."""
-        print("🔄 Running smoke test...")
-        
+        """Run the harness smoke test (one task, loud about contextId bugs)."""
+        print("Running smoke test...")
         try:
-            # Import harness module if available
-            result = subprocess.run(
+            result = self._harness(
                 [
-                    "python3", "-m", "a2a_hack",
                     "smoke",
                     "--personal-url", self.personal_url,
-                    "--cs-url", self.cs_url
+                    "--cs-url", self.cs_url,
                 ],
-                capture_output=True,
-                text=True,
-                timeout=60
+                timeout=600,
             )
-            
-            passed = result.returncode == 0
-            
-            if passed:
-                print("✅ Smoke test PASSED")
-            else:
-                print("❌ Smoke test FAILED")
-                print(result.stderr)
-            
-            return passed
-            
-        except Exception as e:
-            print(f"❌ Smoke test error: {e}")
+        except Exception as e:  # noqa: BLE001 - surface any harness failure
+            print(f"Smoke test error: {e}")
             return False
-    
-    def run_train_eval(self, max_tasks: int = None) -> Dict:
-        """Run evaluation on train split."""
-        print("🔄 Running train split evaluation...")
-        
-        results_path = self.output_dir / f"train_{int(time.time())}.json"
-        
+        ok = result.returncode == 0
+        print("Smoke test PASSED" if ok else "Smoke test FAILED")
+        return ok
+
+    def run_eval(self, split: str = "train") -> Dict:
+        """Run a task split and return parsed metrics."""
+        print(f"Running '{split}' evaluation...")
+        results_dir = self.output_dir / f"{split}_{int(time.time())}"
+
         try:
-            cmd = [
-                "python3", "-m", "a2a_hack",
-                "run",
-                "--personal-url", self.personal_url,
-                "--cs-url", self.cs_url,
-                "--tasks", "train",
-                "--save-to", str(results_path),
-                "--auto-resume"
-            ]
-            
-            if max_tasks:
-                cmd.extend(["--max-tasks", str(max_tasks)])
-            
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=600  # 10 minutes
+            result = self._harness(
+                [
+                    "run",
+                    "--personal-url", self.personal_url,
+                    "--cs-url", self.cs_url,
+                    "--tasks", split,
+                    "--save-to", str(results_dir),
+                    "--auto-resume",
+                ],
+                timeout=3600,  # 18 test tasks can take a while end to end
             )
-            
-            # Parse results
-            if results_path.exists():
-                with open(results_path) as f:
-                    data = json.load(f)
-                return self._analyze_results(data)
-            else:
-                return {"error": "No results file generated"}
-                
-        except Exception as e:
-            return {"error": str(e)}
-    
+        except subprocess.TimeoutExpired:
+            return {"error": "Harness run timed out"}
+
+        results_json = results_dir / "results.json"
+        if not results_json.exists():
+            return {"error": f"No results.json produced (exit {result.returncode})"}
+
+        metrics = self._analyze_results(json.loads(results_json.read_text()))
+        metrics["results_dir"] = str(results_dir)
+        # exit 2 means leftover INFRASTRUCTURE_ERROR sims; results are still valid
+        if result.returncode not in (0, 2):
+            metrics["warning"] = f"harness exited {result.returncode}"
+        return metrics
+
     def _analyze_results(self, data: Dict) -> Dict:
-        """Analyze evaluation results."""
-        total = len(data.get("tasks", []))
-        passed = sum(1 for t in data["tasks"] if t.get("passed", False))
-        failed = total - passed
-        
-        # Calculate metrics
-        success_rate = passed / total if total > 0 else 0
-        
-        # Response times
-        times = [t.get("duration", 0) for t in data["tasks"]]
-        avg_time = sum(times) / len(times) if times else 0
-        
-        # Error analysis
-        errors = {}
-        for task in data["tasks"]:
-            if not task.get("passed", False):
-                error_type = task.get("error_type", "unknown")
-                errors[error_type] = errors.get(error_type, 0) + 1
-        
+        """Analyze a tau2 results.json (uses the simulation_index rewards)."""
+        sims = data.get("simulation_index", [])
+        rewards = [s.get("reward") for s in sims if s.get("reward") is not None]
+        total = len(sims)
+        scored = len(rewards)
+
+        mean_reward = sum(rewards) / scored if scored else 0.0
+        full_credit = sum(1 for r in rewards if r >= 0.999)
+        zero = sum(1 for r in rewards if r <= 0.001)
+
+        durations = [s.get("duration", 0) or 0 for s in sims]
+        avg_time = sum(durations) / len(durations) if durations else 0.0
+
+        terminations: Dict[str, int] = {}
+        for s in sims:
+            reason = s.get("termination_reason", "unknown")
+            terminations[reason] = terminations.get(reason, 0) + 1
+
         return {
             "total_tasks": total,
-            "passed": passed,
-            "failed": failed,
-            "success_rate": success_rate,
-            "avg_response_time": avg_time,
-            "errors_by_type": errors
+            "scored_tasks": scored,
+            "mean_reward": mean_reward,
+            "full_credit": full_credit,
+            "partial": scored - full_credit - zero,
+            "zero": zero,
+            "avg_duration": avg_time,
+            "terminations": terminations,
         }
-    
+
     def generate_report(self, results: Dict) -> str:
-        """Generate formatted report."""
+        """Generate a formatted report."""
         lines = [
             "=" * 60,
-            "A2A CUSTOMER SERVICE AGENT - EVALUATION REPORT",
+            "A2A AGENT PAIR - EVALUATION REPORT",
             "=" * 60,
             "",
-            f"📊 Total Tasks: {results.get('total_tasks', 0)}",
-            f"✅ Passed: {results.get('passed', 0)}",
-            f"❌ Failed: {results.get('failed', 0)}",
-            f"📈 Success Rate: {results.get('success_rate', 0):.1%}",
-            "",
-            f"⏱️  Average Response Time: {results.get('avg_response_time', 0):.2f}s",
+            f"Tasks run:        {results.get('total_tasks', 0)}",
+            f"Mean reward:      {results.get('mean_reward', 0):.3f}   <- score",
+            f"Full credit:      {results.get('full_credit', 0)} / {results.get('scored_tasks', 0)}",
+            f"Partial credit:   {results.get('partial', 0)}",
+            f"Zero reward:      {results.get('zero', 0)}",
+            f"Avg duration:     {results.get('avg_duration', 0):.1f}s",
             "",
         ]
-        
-        # Error breakdown
-        errors = results.get('errors_by_type', {})
-        if errors:
-            lines.append("⚠️  Errors by Type:")
-            for error_type, count in sorted(errors.items(), key=lambda x: x[1], reverse=True):
-                lines.append(f"   {error_type}: {count}")
-        else:
-            lines.append("✅ No errors detected!")
-        
-        lines.extend([
-            "",
-            "=" * 60,
-        ])
-        
+        terminations = results.get("terminations", {})
+        if terminations:
+            lines.append("Termination reasons:")
+            for reason, count in sorted(terminations.items(), key=lambda x: -x[1]):
+                lines.append(f"   {reason}: {count}")
+        if results.get("warning"):
+            lines += ["", f"WARNING: {results['warning']}"]
+        if results.get("results_dir"):
+            lines += ["", f"Results dir: {results['results_dir']}", f"Browse with: uv run tau2 view {results['results_dir']}"]
+        lines += ["", "=" * 60]
         return "\n".join(lines)
-    
-    def save_report(self, report: str, filename: str = "eval_report.txt"):
-        """Save report to file."""
-        report_path = self.output_dir / filename
-        with open(report_path, "w") as f:
-            f.write(report)
-        print(f"📄 Report saved to: {report_path}")
-    
-    def run_full_evaluation(self):
-        """Run complete evaluation suite."""
+
+    def run_full_evaluation(self, split: str = "train", smoke: bool = True) -> bool:
+        """Optionally smoke-test, then run the split and report."""
         print("=" * 60)
-        print("A2A CUSTOMER SERVICE AGENT - FULL EVALUATION")
+        print(f"A2A AGENT PAIR - FULL EVALUATION ('{split}' split)")
         print("=" * 60)
-        print()
-        
-        # Step 1: Smoke test
-        if not self.run_smoke_test():
-            print("\n❌ Smoke test failed, stopping evaluation")
+
+        if smoke and not self.run_smoke_test():
+            print("\nSmoke test failed, stopping evaluation")
             return False
-        
-        print()
-        
-        # Step 2: Train split evaluation
-        print("🔄 Starting train split evaluation...")
-        print("   (This may take several minutes)")
-        print()
-        
-        results = self.run_train_eval(max_tasks=10)  # Start with 10 tasks
-        
+
+        results = self.run_eval(split)
         if "error" in results:
-            print(f"❌ Evaluation error: {results['error']}")
+            print(f"Evaluation error: {results['error']}")
             return False
-        
-        # Generate and display report
-        report = self.generate_report(results)
-        print(report)
-        
-        # Save report
-        self.save_report(report)
-        
-        # Summary
-        success_rate = results.get('success_rate', 0)
-        if success_rate >= 0.8:
-            print("\n🎉 EXCELLENT: 80%+ success rate!")
-        elif success_rate >= 0.6:
-            print("\n✅ GOOD: 60-80% success rate")
-        elif success_rate >= 0.4:
-            print("\n⚠️  NEEDS IMPROVEMENT: 40-60% success rate")
+
+        print(self.generate_report(results))
+
+        mean = results.get("mean_reward", 0)
+        if mean >= 0.8:
+            print("\nEXCELLENT: 0.80+ mean reward")
+        elif mean >= 0.6:
+            print("\nGOOD: 0.60-0.80 mean reward")
+        elif mean >= 0.4:
+            print("\nNEEDS IMPROVEMENT: 0.40-0.60 mean reward")
         else:
-            print("\n❌ CRITICAL: Below 40% success rate")
-        
-        return success_rate >= 0.6  # Consider 60%+ as passing
+            print("\nCRITICAL: below 0.40 mean reward")
+        return mean >= 0.6
 
 
 def main():
     """Main entry point."""
     import argparse
-    
-    parser = argparse.ArgumentParser(description="Run A2A Agent Evaluation")
+
+    parser = argparse.ArgumentParser(description="Run A2A agent evaluation via the a2a-hack harness")
     parser.add_argument("--personal-url", default="http://localhost:9001")
     parser.add_argument("--cs-url", default="http://localhost:9002")
-    parser.add_argument("--output", default="results")
+    parser.add_argument("--harness-dir", default=str(DEFAULT_HARNESS_DIR))
+    parser.add_argument("--tasks", default="train", help="Split (train/test/feedback) or comma-separated task ids")
+    parser.add_argument("--output", default=None, help="Results parent dir (default: <harness>/results)")
     parser.add_argument("--smoke-only", action="store_true")
-    
+    parser.add_argument("--no-smoke", action="store_true", help="Skip the pre-run smoke test")
+
     args = parser.parse_args()
-    
+
     runner = EvaluationRunner(
         personal_url=args.personal_url,
         cs_url=args.cs_url,
-        output_dir=args.output
+        harness_dir=args.harness_dir,
+        output_dir=args.output,
     )
-    
+
     if args.smoke_only:
         success = runner.run_smoke_test()
     else:
-        success = runner.run_full_evaluation()
-    
+        success = runner.run_full_evaluation(split=args.tasks, smoke=not args.no_smoke)
+
     sys.exit(0 if success else 1)
 
 

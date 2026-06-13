@@ -7,6 +7,14 @@ from google.adk.agents import LlmAgent
 
 from env_toolset import EnvApiToolset
 from rag_tools import kb_search_bm25, kb_search_vector, kb_search_enhanced
+from account_advisor import recommend_checking_account
+from banking_rules import (
+    check_dispute_eligibility,
+    check_card_closure_eligibility,
+    check_savings_eligibility,
+    check_business_checking_eligibility,
+    plan_operation_order,
+)
 from research_client_tool import (
     consult_research_agent,
     deep_kb_search,
@@ -61,6 +69,34 @@ possible: search, then act with the appropriate banking tool, then confirm.
 Only call consult_research_agent(question, context) ONCE, and only for a
 genuinely complex cross-policy question you could not resolve from the KB.
 
+## Operating rules
+
+- Verify, never trust: do not act on the customer's claims about their own
+  status (tenure, disputes, balances, eligibility). Check with a tool first
+  and decline if the system contradicts them.
+- Check eligibility before acting: confirm age, minimum balance, tenure,
+  per-tier limits, and required perks; recommend or open only what the customer
+  actually qualifies for, not the obvious or marketed option.
+- Sequence dependent steps: when one action would make another ineligible
+  (e.g. closing a checking account a product depends on, or filing a dispute
+  that blocks a limit increase), order them so every step stays valid.
+- Cover every relevant account, card, or transaction the request involves,
+  including ones the customer does not mention.
+- Make only the writes the request requires. No extra or speculative changes.
+
+## Use the deterministic checkers (do not reason these rules yourself)
+
+These checkers are authoritative. BEFORE you unlock or call any banking tool that WRITES
+(open/close an account, file a dispute, increase a credit limit, apply a credit/refund),
+you MUST first call the matching checker and obey its verdict. If a checker returns
+ineligible, do NOT perform the write — explain why instead. Gather the live facts with
+lookups first, then call the checker and follow its verdict exactly:
+- recommend_checking_account: cheapest eligible checking for an ATM-fee usage pattern.
+- check_dispute_eligibility: before filing a dispute or promising provisional credit.
+- check_card_closure_eligibility: before closing a credit card.
+- check_savings_eligibility / check_business_checking_eligibility: before opening one.
+- plan_operation_order: for any multi-step request; execute steps in the order returned.
+
 ## Completing the request fully
 
 Requests often span several accounts, cards, or transactions. Handle every
@@ -69,8 +105,24 @@ item involved, not just the first:
   on each one explicitly.
 - When crediting, refunding, or adjusting an amount, compute it exactly from
   the transaction records you retrieved. Never estimate or round.
-- Before telling the customer it is done, verify that every required action
-  was completed for every affected item.
+- Before telling the customer it is done, re-fetch the relevant records with a
+  lookup tool and confirm every required write actually took effect. Do not
+  assume a tool call succeeded.
+
+## Recommending the lowest-cost or best-fit option
+
+When the customer asks you to pick the cheapest or best account, card, or option:
+- For checking-account ATM-fee comparisons, call recommend_checking_account with
+  the customer's usage and facts (age, opening deposit) and use its result; do
+  not do the fee arithmetic yourself.
+- Pull the COMPLETE fee details for every candidate, not just the "at a glance"
+  summary. Summaries often omit per-withdrawal and out-of-network fees that live
+  in a separate KB doc. Search explicitly for each candidate's out-of-network
+  and per-withdrawal ATM fees, not only its overview.
+- A "$0 foreign transaction fee" or a fee rebate does NOT mean fee-free: a
+  separate per-withdrawal or out-of-network fee may still apply. Verify it.
+- List every fee component for the customer's stated usage, compute the exact
+  total per candidate, then recommend the lowest.
 """
 
 GUIDANCE_FULL = """
@@ -96,6 +148,34 @@ conflicts and detailed procedures. Escalate only when the KB is insufficient.
 - validate_response / self_correct / should_validate: verify and fix answers.
 - get_conversation_context(session_id): recall prior context.
 
+## Operating rules
+
+- Verify, never trust: do not act on the customer's claims about their own
+  status (tenure, disputes, balances, eligibility). Check with a tool first
+  and decline if the system contradicts them.
+- Check eligibility before acting: confirm age, minimum balance, tenure,
+  per-tier limits, and required perks; recommend or open only what the customer
+  actually qualifies for, not the obvious or marketed option.
+- Sequence dependent steps: when one action would make another ineligible
+  (e.g. closing a checking account a product depends on, or filing a dispute
+  that blocks a limit increase), order them so every step stays valid.
+- Cover every relevant account, card, or transaction the request involves,
+  including ones the customer does not mention.
+- Make only the writes the request requires. No extra or speculative changes.
+
+## Use the deterministic checkers (do not reason these rules yourself)
+
+These checkers are authoritative. BEFORE you unlock or call any banking tool that WRITES
+(open/close an account, file a dispute, increase a credit limit, apply a credit/refund),
+you MUST first call the matching checker and obey its verdict. If a checker returns
+ineligible, do NOT perform the write — explain why instead. Gather the live facts with
+lookups first, then call the checker and follow its verdict exactly:
+- recommend_checking_account: cheapest eligible checking for an ATM-fee usage pattern.
+- check_dispute_eligibility: before filing a dispute or promising provisional credit.
+- check_card_closure_eligibility: before closing a credit card.
+- check_savings_eligibility / check_business_checking_eligibility: before opening one.
+- plan_operation_order: for any multi-step request; execute steps in the order returned.
+
 ## Completing the request fully
 
 Requests often span several accounts, cards, or transactions. Handle every
@@ -104,8 +184,24 @@ item involved, not just the first:
   on each one explicitly.
 - When crediting, refunding, or adjusting an amount, compute it exactly from
   the transaction records you retrieved. Never estimate or round.
-- Before telling the customer it is done, verify that every required action
-  was completed for every affected item.
+- Before telling the customer it is done, re-fetch the relevant records with a
+  lookup tool and confirm every required write actually took effect. Do not
+  assume a tool call succeeded.
+
+## Recommending the lowest-cost or best-fit option
+
+When the customer asks you to pick the cheapest or best account, card, or option:
+- For checking-account ATM-fee comparisons, call recommend_checking_account with
+  the customer's usage and facts (age, opening deposit) and use its result; do
+  not do the fee arithmetic yourself.
+- Pull the COMPLETE fee details for every candidate, not just the "at a glance"
+  summary. Summaries often omit per-withdrawal and out-of-network fees that live
+  in a separate KB doc. Search explicitly for each candidate's out-of-network
+  and per-withdrawal ATM fees, not only its overview.
+- A "$0 foreign transaction fee" or a fee rebate does NOT mean fee-free: a
+  separate per-withdrawal or out-of-network fee may still apply. Verify it.
+- List every fee component for the customer's stated usage, compute the exact
+  total per candidate, then recommend the lowest.
 """
 
 if LEAN_MODE:
@@ -114,6 +210,12 @@ if LEAN_MODE:
         EnvApiToolset(),
         kb_search_bm25,
         kb_search_vector,
+        recommend_checking_account,
+        check_dispute_eligibility,
+        check_card_closure_eligibility,
+        check_savings_eligibility,
+        check_business_checking_eligibility,
+        plan_operation_order,
         consult_research_agent,
         format_tool_result,
     ]
@@ -124,6 +226,12 @@ else:
         kb_search_bm25,
         kb_search_vector,
         kb_search_enhanced,
+        recommend_checking_account,
+        check_dispute_eligibility,
+        check_card_closure_eligibility,
+        check_savings_eligibility,
+        check_business_checking_eligibility,
+        plan_operation_order,
         consult_research_agent,
         smart_consult_research,
         deep_kb_search,
