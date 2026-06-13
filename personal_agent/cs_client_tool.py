@@ -14,7 +14,7 @@ from env_toolset import session_id
 
 CS_AGENT_URL = os.environ["CS_AGENT_URL"]
 
-_TIMEOUT_S = 120.0
+_TIMEOUT_S = 300.0
 
 
 def _text_of_message(message: Message) -> str:

@@ -105,6 +105,11 @@ you use, only that final text reaches the other side.
    conversation must be fully isolated by its contextId.
 4. **The model** (see Rules), and the environment itself — the tasks, env
    tools, and simulated user belong to the harness.
+5. **The harness timeouts.** Each agent turn must finish within 5 minutes and
+   each whole task within 10 minutes, or the run is scored 0. These limits are
+   fixed by the harness. You may change the local run `--concurrency`, but
+   raising it on a single Vertex key causes 429 rate-limit errors that slow
+   your agents into these timeouts, so it isn't recommended.
 
 ## Environment tools
 
