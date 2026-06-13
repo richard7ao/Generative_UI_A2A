@@ -7,6 +7,7 @@ The research agent provides deep research capabilities for the CS agent:
 - Procedural guidance extraction
 """
 
+import asyncio
 import os
 import re
 import struct
@@ -76,7 +77,7 @@ def _strip_score(docs: list[dict]) -> list[dict]:
     return docs
 
 
-def deep_search(query: str, top_k: int = 10) -> list[dict]:
+async def deep_search(query: str, top_k: int = 10) -> list[dict]:
     """Deep search combining BM25 and vector search with result fusion.
 
     This performs both keyword and semantic search, then fuses results
@@ -89,33 +90,39 @@ def deep_search(query: str, top_k: int = 10) -> list[dict]:
     Returns:
         Ranked documents with doc_id, title, content, and search type.
     """
-    # Get BM25 results
-    terms = re.findall(r"\w+", query.lower())
-    bm25_results = []
-    if terms:
+    # Run BM25 and vector search concurrently; each offloads its blocking Redis
+    # and embedding calls to a thread so the event loop stays free.
+    async def _bm25() -> list[dict]:
+        terms = re.findall(r"\w+", query.lower())
+        if not terms:
+            return []
         or_query = "|".join(dict.fromkeys(terms))
-        reply = _client.execute_command(
+        reply = await asyncio.to_thread(
+            _client.execute_command,
             "FT.SEARCH", KB_INDEX, or_query,
             "LIMIT", "0", str(top_k * 2),
             "RETURN", "2", "title", "content",
         )
-        bm25_results = _parse_search_reply(reply)
+        return _parse_search_reply(reply)
 
-    # Get vector results
-    vector_results = []
-    try:
-        vector = struct.pack(f"{EMBEDDING_DIM}f", *_embed([query])[0])
-        reply = _client.execute_command(
-            "FT.SEARCH", KB_INDEX, f"*=>[KNN {top_k * 2} @embedding $vec AS score]",
-            "PARAMS", "2", "vec", vector,
-            "SORTBY", "score",
-            "LIMIT", "0", str(top_k * 2),
-            "RETURN", "3", "title", "content", "score",
-            "DIALECT", "2",
-        )
-        vector_results = _strip_score(_parse_search_reply(reply))
-    except Exception:
-        pass
+    async def _vector() -> list[dict]:
+        try:
+            emb = await asyncio.to_thread(_embed, [query])
+            vector = struct.pack(f"{EMBEDDING_DIM}f", *emb[0])
+            reply = await asyncio.to_thread(
+                _client.execute_command,
+                "FT.SEARCH", KB_INDEX, f"*=>[KNN {top_k * 2} @embedding $vec AS score]",
+                "PARAMS", "2", "vec", vector,
+                "SORTBY", "score",
+                "LIMIT", "0", str(top_k * 2),
+                "RETURN", "3", "title", "content", "score",
+                "DIALECT", "2",
+            )
+            return _strip_score(_parse_search_reply(reply))
+        except Exception:
+            return []
+
+    bm25_results, vector_results = await asyncio.gather(_bm25(), _vector())
 
     # Reciprocal Rank Fusion
     def rrf_fuse(bm25_docs: list[dict], vector_docs: list[dict], k: int = 60) -> list[dict]:
@@ -142,7 +149,7 @@ def deep_search(query: str, top_k: int = 10) -> list[dict]:
     return rrf_fuse(bm25_results, vector_results)
 
 
-def analyze_policy_conflicts(topic: str) -> dict[str, Any]:
+async def analyze_policy_conflicts(topic: str) -> dict[str, Any]:
     """Search for and analyze potential policy conflicts or edge cases.
 
     Args:
@@ -151,10 +158,7 @@ def analyze_policy_conflicts(topic: str) -> dict[str, Any]:
     Returns:
         Analysis including potential conflicts, gaps, or special cases found.
     """
-    # Search for documents related to the topic
-    docs = deep_search(topic, top_k=15)
-
-    # Also search for exceptions, overrides, special cases
+    # Search the topic plus exception/override patterns, all concurrently
     exception_queries = [
         f"{topic} exception",
         f"{topic} override",
@@ -162,10 +166,14 @@ def analyze_policy_conflicts(topic: str) -> dict[str, Any]:
         f"{topic} not applicable",
         f"{topic} waiver",
     ]
+    base_docs, *exception_results = await asyncio.gather(
+        deep_search(topic, top_k=15),
+        *[deep_search(q, top_k=5) for q in exception_queries],
+    )
 
-    all_docs = {d["doc_id"]: d for d in docs}
-    for q in exception_queries:
-        for doc in deep_search(q, top_k=5):
+    all_docs = {d["doc_id"]: d for d in base_docs}
+    for doc_list in exception_results:
+        for doc in doc_list:
             all_docs[doc["doc_id"]] = doc
 
     return {
@@ -176,7 +184,7 @@ def analyze_policy_conflicts(topic: str) -> dict[str, Any]:
     }
 
 
-def extract_procedures(task_description: str) -> dict[str, Any]:
+async def extract_procedures(task_description: str) -> dict[str, Any]:
     """Extract step-by-step procedures for a specific task from the KB.
 
     Args:
@@ -185,7 +193,7 @@ def extract_procedures(task_description: str) -> dict[str, Any]:
     Returns:
         Relevant procedures with steps, required tools, and prerequisites.
     """
-    # Search for procedures related to the task
+    # Search every procedure phrasing concurrently
     procedure_queries = [
         f"how to {task_description}",
         f"procedure for {task_description}",
@@ -194,9 +202,10 @@ def extract_procedures(task_description: str) -> dict[str, Any]:
         task_description,
     ]
 
+    results = await asyncio.gather(*[deep_search(q, top_k=5) for q in procedure_queries])
     all_docs: dict[str, dict] = {}
-    for query in procedure_queries:
-        for doc in deep_search(query, top_k=5):
+    for doc_list in results:
+        for doc in doc_list:
             all_docs[doc["doc_id"]] = doc
 
     return {
@@ -206,7 +215,7 @@ def extract_procedures(task_description: str) -> dict[str, Any]:
     }
 
 
-def find_related_policies(policy_area: str) -> dict[str, Any]:
+async def find_related_policies(policy_area: str) -> dict[str, Any]:
     """Find all policies related to a specific area, including cross-references.
 
     Args:
@@ -215,22 +224,21 @@ def find_related_policies(policy_area: str) -> dict[str, Any]:
     Returns:
         Related policies with relationship mapping.
     """
-    # Direct search
-    direct_docs = deep_search(policy_area, top_k=10)
-
-    # Find cross-references by searching for mentions
-    related_docs: dict[str, dict] = {d["doc_id"]: d for d in direct_docs}
-
-    # Search for related terms
+    # Direct search plus related-term searches, all concurrently
     related_terms = [
         f"related to {policy_area}",
         f"applies to {policy_area}",
         f"{policy_area} holders",
         f"{policy_area} customers",
     ]
+    direct_docs, *related_results = await asyncio.gather(
+        deep_search(policy_area, top_k=10),
+        *[deep_search(term, top_k=5) for term in related_terms],
+    )
 
-    for term in related_terms:
-        for doc in deep_search(term, top_k=5):
+    related_docs: dict[str, dict] = {d["doc_id"]: d for d in direct_docs}
+    for doc_list in related_results:
+        for doc in doc_list:
             if doc["doc_id"] not in related_docs:
                 related_docs[doc["doc_id"]] = {**doc, "relationship": "cross-reference"}
 
@@ -242,7 +250,7 @@ def find_related_policies(policy_area: str) -> dict[str, Any]:
     }
 
 
-def research_answer(question: str, context: str = "") -> dict[str, Any]:
+async def research_answer(question: str, context: str = "") -> dict[str, Any]:
     """Comprehensive research to answer a complex policy or procedural question.
 
     This is the main entry point for CS agent research requests.
@@ -254,18 +262,19 @@ def research_answer(question: str, context: str = "") -> dict[str, Any]:
     Returns:
         Comprehensive research findings with sources and confidence.
     """
-    # Perform deep search
-    docs = deep_search(question, top_k=12)
-
-    # If we have context, also search for context-specific information
+    # Search the question and (if given) the context concurrently
     if context:
-        context_docs = deep_search(context, top_k=8)
-        # Merge without duplicates
+        docs, context_docs = await asyncio.gather(
+            deep_search(question, top_k=12),
+            deep_search(context, top_k=8),
+        )
         seen = {d["doc_id"] for d in docs}
         for doc in context_docs:
             if doc["doc_id"] not in seen:
                 docs.append(doc)
                 seen.add(doc["doc_id"])
+    else:
+        docs = await deep_search(question, top_k=12)
 
     return {
         "question": question,

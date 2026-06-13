@@ -7,6 +7,7 @@ kb_search_vector: HNSW vector search over gemini-embedding-001 embeddings
 Replies are parsed via execute_command so both the classic array reply and
 the Redis 8 map-style reply work regardless of redis-py version."""
 
+import asyncio
 import os
 import re
 import struct
@@ -136,14 +137,17 @@ def deduplicate_results(results_list: List[list[dict]]) -> list[dict]:
     for results in results_list:
         for doc in results:
             doc_id = doc.get("doc_id")
-            if doc_id and doc_id not in seen_ids:
+            if not doc_id:
+                # No usable id to dedup on: keep the doc instead of dropping it
+                merged.append(doc)
+            elif doc_id not in seen_ids:
                 seen_ids.add(doc_id)
                 merged.append(doc)
     
     return merged
 
 
-def kb_search_bm25(query: str, top_k: int = 5) -> list[dict]:
+async def kb_search_bm25(query: str, top_k: int = 5) -> list[dict]:
     """Full-text (BM25) search over the Rho-Bank knowledge base.
 
     Args:
@@ -159,7 +163,10 @@ def kb_search_bm25(query: str, top_k: int = 5) -> list[dict]:
         return []
     # OR-join: RediSearch defaults to AND, which zeroes out long queries.
     or_query = "|".join(dict.fromkeys(terms))
-    reply = _client.execute_command(
+    # Run the blocking Redis call off the event loop so concurrent A2A turns on
+    # this single worker don't serialize behind each other.
+    reply = await asyncio.to_thread(
+        _client.execute_command,
         "FT.SEARCH", KB_INDEX, or_query,
         "LIMIT", "0", str(top_k),
         "RETURN", "2", "title", "content",
@@ -167,7 +174,7 @@ def kb_search_bm25(query: str, top_k: int = 5) -> list[dict]:
     return _parse_search_reply(reply)
 
 
-def kb_search_vector(query: str, top_k: int = 5) -> list[dict]:
+async def kb_search_vector(query: str, top_k: int = 5) -> list[dict]:
     """Semantic (vector) search over the Rho-Bank knowledge base.
 
     Better than kb_search_bm25 when the query is a natural-language question
@@ -182,8 +189,12 @@ def kb_search_vector(query: str, top_k: int = 5) -> list[dict]:
         entry telling you to fall back to kb_search_bm25.
     """
     try:
-        vector = struct.pack(f"{EMBEDDING_DIM}f", *_embed([query])[0])
-        reply = _client.execute_command(
+        # Offload the blocking embedding HTTP call and Redis query to threads so
+        # the event loop stays free for other concurrent turns.
+        emb = await asyncio.to_thread(_embed, [query])
+        vector = struct.pack(f"{EMBEDDING_DIM}f", *emb[0])
+        reply = await asyncio.to_thread(
+            _client.execute_command,
             "FT.SEARCH", KB_INDEX, f"*=>[KNN {top_k} @embedding $vec AS score]",
             "PARAMS", "2", "vec", vector,
             "SORTBY", "score",
@@ -201,7 +212,7 @@ def kb_search_vector(query: str, top_k: int = 5) -> list[dict]:
         ]
 
 
-def kb_search_enhanced(query: str, top_k: int = 5) -> list[dict]:
+async def kb_search_enhanced(query: str, top_k: int = 5) -> list[dict]:
     """Enhanced search with query expansion for better recall.
     
     Performs multiple searches with expanded query variations and merges
@@ -217,11 +228,12 @@ def kb_search_enhanced(query: str, top_k: int = 5) -> list[dict]:
     # Expand query with synonyms
     expanded_queries = expand_query(query)
     
-    # Search with each variation
-    all_results = []
-    for expanded_query in expanded_queries:
-        results = kb_search_bm25(expanded_query, top_k=min(top_k, 3))
-        all_results.append(results)
+    # Search every expanded variation concurrently
+    all_results = list(
+        await asyncio.gather(
+            *[kb_search_bm25(eq, top_k=min(top_k, 3)) for eq in expanded_queries]
+        )
+    )
     
     # Deduplicate and return merged results
     merged = deduplicate_results(all_results)
