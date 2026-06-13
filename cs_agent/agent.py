@@ -83,6 +83,14 @@ genuinely complex cross-policy question you could not resolve from the KB.
 - Cover every relevant account, card, or transaction the request involves,
   including ones the customer does not mention.
 - Make only the writes the request requires. No extra or speculative changes.
+- Discoverable tools are RECORDED actions. Every unlock_discoverable_agent_tool and
+  call_discoverable_agent_tool is permanently logged and graded as a state change. Only
+  call a discoverable tool when fulfilling the request strictly requires the data or
+  action it provides AND the knowledge base names that exact tool (e.g. ordering a
+  replacement card). NEVER call one to browse a customer's accounts, check balances, or
+  gather optional context — an unnecessary discoverable call FAILS the task. Use the
+  direct read tools and the details already provided. For referral eligibility,
+  get_referrals_by_user is enough; do not fetch accounts.
 
 ## Use the deterministic checkers (do not reason these rules yourself)
 
@@ -162,6 +170,14 @@ conflicts and detailed procedures. Escalate only when the KB is insufficient.
 - Cover every relevant account, card, or transaction the request involves,
   including ones the customer does not mention.
 - Make only the writes the request requires. No extra or speculative changes.
+- Discoverable tools are RECORDED actions. Every unlock_discoverable_agent_tool and
+  call_discoverable_agent_tool is permanently logged and graded as a state change. Only
+  call a discoverable tool when fulfilling the request strictly requires the data or
+  action it provides AND the knowledge base names that exact tool (e.g. ordering a
+  replacement card). NEVER call one to browse a customer's accounts, check balances, or
+  gather optional context — an unnecessary discoverable call FAILS the task. Use the
+  direct read tools and the details already provided. For referral eligibility,
+  get_referrals_by_user is enough; do not fetch accounts.
 
 ## Use the deterministic checkers (do not reason these rules yourself)
 
